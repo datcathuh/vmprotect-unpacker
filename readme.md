@@ -17,7 +17,7 @@ note the project at this current state is not finished / got some issues i am wo
 
 ![non packed](assets/nopack.png)
 
-non packed pseudo:
+non packed pseudo
 ```c
 int __stdcall WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd)
 {
