@@ -1,10 +1,10 @@
 # credits
 
-deepseek - helped me actually understand the vmprotect source and write most of the unpack logic
-stormingmoon - yoinked some code from one of his bases for the injector / pe parsing
-callstack spoofer - https://github.com/Barracudach/CallStack-Spoofer/
-string encryption - https://github.com/JustasMasiulis/xorstr
-vmprotect 3.5.1 source - https://0xacab.org/bidasci/vmprotect-3.5.1
+- deepseek - helped me actually understand the vmprotect source and write most of the unpack logic
+- stormingmoon - [inspired me & took some code from his base]
+- callstack spoofer - https://github.com/Barracudach/CallStack-Spoofer/
+- string encryption - https://github.com/JustasMasiulis/xorstr
+- vmprotect 3.5.1 source - https://0xacab.org/bidasci/vmprotect-3.5.1
 
 # notes
 
