@@ -1,0 +1,2 @@
+#include "resource.h"
+IDR_UNPACKER_DLL RCDATA "..\\..\\..\\bin\\vmprotect_dll.dll"
