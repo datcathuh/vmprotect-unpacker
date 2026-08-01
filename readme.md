@@ -42,3 +42,8 @@ __int64 sub_140001000()
   return 0;
 }
 ```
+
+
+
+# legal
+This is for Educational purposes only, do not use on project's / files u do NOT own
