@@ -10,6 +10,7 @@
 # notes
 THIS ISNT CLOSE TO DONE GOT SOME MAYOR BUGS BE AWARE
 
+tested / developed on vmprotect v 3.8.4
 u might get flagged for debugger but it still dumps / unpacks from what i noticed.
 
 also the import rebuilding is kinda scuffed sometimes, dumped exe might crash. brute-force scan doesnt always find all the iat slots. if u wanna fix it go ahead idk will look into it in the future.
