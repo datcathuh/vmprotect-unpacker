@@ -5,8 +5,6 @@
 
 - deepseek - helped me actually understand the vmprotect source and write most of the unpack logic
 - StormingMoon/VMProtectUnpacker - [inspired me & took some code from his base]
-- callstack spoofer - https://github.com/Barracudach/CallStack-Spoofer/
-- string encryption - https://github.com/JustasMasiulis/xorstr
 - vmprotect 3.5.1 source - https://0xacab.org/bidasci/vmprotect-3.5.1
 
 # notes
@@ -49,5 +47,12 @@ __int64 sub_140001000()
 
 
 
-# legal
-This is for Educational purposes only, do not use on project's / files u do NOT own
+# Legal / Intended Use
+
+This project is intended for security research, reverse-engineering education, and analysis of software that you are legally authorized to analyze.
+
+Only use this software with binaries, software, and systems that you own or have explicit permission to analyze. Do not use it to circumvent licensing restrictions, access controls, or other protections on software without authorization.
+
+This project is not affiliated with or endorsed by VMProtect or its developers.
+
+You are responsible for ensuring that your use of this software complies with applicable laws, licenses, and agreements.

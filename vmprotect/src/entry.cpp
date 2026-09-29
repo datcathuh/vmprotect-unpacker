@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <common.h>
+#include <cstdlib>
 
 LONG WINAPI VectoredExceptionHandler(PEXCEPTION_POINTERS pExceptionInfo) {
     std::string msg = "\n[!!!] EXCEPTION CAUGHT !!!\n";
@@ -46,9 +47,9 @@ void print_banner()
 
 void init()
 {
-    SetConsoleTitleA(EC("t.me/x3ghx"));
+    SetConsoleTitleA("t.me/x3ghx / github.com/datcathuh/vmprotect-unpacker");
     SetConsoleOutputCP(CP_UTF8);
-    SPOOF_CALL(print_banner)();
+    print_banner();
 
     PVOID handler = AddVectoredExceptionHandler(1, VectoredExceptionHandler);
     if (handler) {
@@ -69,22 +70,51 @@ static bool IsElevated() {
     return elevated;
 }
 
+static bool HasDllExtension(const char* path) {
+    size_t len = strlen(path);
+    if (len < 4) return false;
+    const char* ext = path + len - 4;
+    return (ext[0] == '.') &&
+           ((ext[1]=='d'||ext[1]=='D') && (ext[2]=='l'||ext[2]=='L') && (ext[3]=='l'||ext[3]=='L'));
+}
+
 int main(int argc, char* argv[]) {
-    SPOOF_CALL(init)();
+    init();
 
     if (argc < 2) {
-        std::cout << "Usage: " << argv[0] << " <target.exe>\n";
+        std::cout << "Usage: " << argv[0] << " <target.exe|target.dll>\n";
+        std::cout << "       " << argv[0] << " -pid <pid> [module.exe|module.dll]\n";
         return 1;
     }
 
-    std::wstring exePath = std::wstring(argv[1], argv[1] + strlen(argv[1]));
+    DllInjector injector;
+    bool ok = false;
 
-    if (!IsElevated()) {
-        Log("[~] Not running as admin — some targets may need elevation (run as admin if it fails)");
+    if (strcmp(argv[1], "-pid") == 0) {
+        if (argc < 3) {
+            std::cout << "Usage: " << argv[0] << " -pid <pid> [module.exe|module.dll]\n";
+            return 1;
+        }
+        DWORD pid = (DWORD)_atoi64(argv[2]);
+        std::wstring modulePath;
+        if (argc > 3) {
+            modulePath = std::wstring(argv[3], argv[3] + strlen(argv[3]));
+            wchar_t fullPath[MAX_PATH];
+            if (GetFullPathNameW(modulePath.c_str(), MAX_PATH, fullPath, nullptr))
+                modulePath = fullPath;
+        }
+        ok = injector.AttachPid(pid, modulePath);
+    } else {
+        std::wstring targetPath = std::wstring(argv[1], argv[1] + strlen(argv[1]));
+        bool isDll = HasDllExtension(argv[1]);
+
+        if (!IsElevated()) {
+            Log("[~] Not running as admin — some targets may need elevation (run as admin if it fails)");
+        }
+
+        ok = isDll ? injector.InjectDll(targetPath) : injector.Inject(targetPath);
     }
 
-    DllInjector injector;
-    bool ok = injector.Inject(exePath);
     std::cout << "[~] Injection " << (ok ? "succeeded" : "failed") << std::endl;
 
     return -1337;

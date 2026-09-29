@@ -206,29 +206,39 @@ static NTSTATUS NTAPI NtRaiseHardErrorHook(
     ULONG ValidResponseOptions, DWORD* Response)
 {
     if (Response) *Response = 3;
-    DbgLog("[*] NtRaiseHardError suppressed, blocking thread for 30s...");
-    Sleep(30000);
+    DbgLog("[*] NtRaiseHardError suppressed, blocking thread for 5s...");
+    Sleep(5000);
     return 0;
 }
 
 bool PatchNtRaiseHardError() {
+    DbgLog("[HOOK] PatchNtRaiseHardError enter");
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (!ntdll) return false;
+    if (!ntdll) { DbgLog("[HOOK] ntdll not found"); return false; }
 
     FARPROC target = GetProcAddress(ntdll, "NtRaiseHardError");
-    if (!target) return false;
+    if (!target) { DbgLog("[HOOK] NtRaiseHardError not found"); return false; }
+    DbgLogF("[HOOK] NtRaiseHardError at %p", target);
 
     BYTE* code = (BYTE*)target;
 
     MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQuery(code, &mbi, sizeof(mbi)) == 0) return false;
+    if (VirtualQuery(code, &mbi, sizeof(mbi)) == 0) { DbgLog("[HOOK] VirtualQuery failed"); return false; }
+    DbgLogF("[HOOK] VirtualQuery base=%p prot=%X", mbi.BaseAddress, mbi.Protect);
+
     DWORD oldProtect;
-    if (!VirtualProtect(mbi.BaseAddress, mbi.RegionSize, PAGE_READWRITE, &oldProtect)) return false;
+    if (!VirtualProtect(mbi.BaseAddress, mbi.RegionSize, PAGE_READWRITE, &oldProtect)) {
+        DbgLog("[HOOK] VirtualProtect failed");
+        return false;
+    }
+    DbgLog("[HOOK] VirtualProtect PAGE_READWRITE ok");
 
     if (code[0] == 0xE9) {
+        DbgLog("[HOOK] already hooked (E9), skipping");
         VirtualProtect(mbi.BaseAddress, mbi.RegionSize, oldProtect, &oldProtect);
         return true;
     }
+    DbgLogF("[HOOK] code[0]=0x%02X", code[0]);
 
     // 5-byte jmp rel32 (safe for syscall stubs which are at least 8 bytes)
     INT_PTR offset = (INT_PTR)NtRaiseHardErrorHook - ((INT_PTR)code + 5);
@@ -239,7 +249,10 @@ bool PatchNtRaiseHardError() {
     }
     BYTE patch[5] = { 0xE9 };
     *(INT32*)&patch[1] = (INT32)offset;
+
+    DbgLog("[HOOK] writing 5-byte JMP patch...");
     memcpy(code, patch, sizeof(patch));
+    DbgLog("[HOOK] memcpy done");
 
     VirtualProtect(mbi.BaseAddress, mbi.RegionSize, oldProtect, &oldProtect);
     DbgLog("[+] NtRaiseHardError hooked (dialog suppressed)");

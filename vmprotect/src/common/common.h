@@ -18,9 +18,6 @@
 #include "../resources/resource.h"
 #include "../utils/log.h"
 
-/* string encryption & callstack spoofer */
-#include "protect/enc.h"
-#include "protect/spoof.h"
 
 /* core implementation */
 //#include "../core/pe/defs.h"

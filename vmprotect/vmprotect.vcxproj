@@ -73,22 +73,22 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <OutDir>../bin/</OutDir>
     <IntDir>../bin/obj/exe/</IntDir>
-    <IncludePath>$(ProjectDir)deps;$(ProjectDir)src\common\;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir);$(ProjectDir)src\common\;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <OutDir>../bin/</OutDir>
     <IntDir>../bin/obj/exe/</IntDir>
-    <IncludePath>$(ProjectDir)deps;$(ProjectDir)src\common\;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir);$(ProjectDir)src\common\;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <OutDir>../bin/</OutDir>
     <IntDir>../bin/obj/exe/</IntDir>
-    <IncludePath>$(ProjectDir)deps;$(ProjectDir)src\common\;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir);$(ProjectDir)src\common\;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <OutDir>../bin/</OutDir>
     <IntDir>../bin/obj/exe/</IntDir>
-    <IncludePath>$(ProjectDir)deps;$(ProjectDir)src\common\;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir);$(ProjectDir)src\common\;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -131,7 +131,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <UACExecutionLevel>AsInvoker</UACExecutionLevel>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -147,7 +147,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <UACExecutionLevel>AsInvoker</UACExecutionLevel>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -157,8 +157,6 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\common\common.h" />
-    <ClInclude Include="deps\protect\enc.h" />
-    <ClInclude Include="deps\protect\spoof.h" />
     <ClInclude Include="src\core\pe\injection.h" />
     <ClInclude Include="src\core\pe\pe.h" />
     <ClInclude Include="src\resources\resource.h" />
@@ -167,6 +165,12 @@
   <ItemGroup>
     <ResourceCompile Include="src\resources\resources.rc" />
   </ItemGroup>
+  <ItemDefinitionGroup>
+    <PreBuildEvent>
+      <Message>Refreshing resources.rc to embed up-to-date binaries</Message>
+      <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$f = '$(ProjectDir)src\resources\resources.rc'; $b = [IO.File]::ReadAllBytes($f); [IO.File]::WriteAllBytes($f, $b)"</Command>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

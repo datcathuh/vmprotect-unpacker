@@ -10,11 +10,6 @@
 #include <algorithm>
 #pragma comment(lib, "psapi.lib")
 
-static ULONGLONG FindImageBase() {
-    PPEB peb = NtCurrentTeb()->ProcessEnvironmentBlock;
-    return (ULONGLONG)peb->Reserved3[1];
-}
-
 static bool IsValidPeHeader(const BYTE* data, SIZE_T size) {
     if (size < sizeof(IMAGE_DOS_HEADER)) return false;
     const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)data;
@@ -26,13 +21,13 @@ static bool IsValidPeHeader(const BYTE* data, SIZE_T size) {
     return magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC || magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
 }
 
-static DWORD ScanForOep(BYTE* dump, DWORD size, DWORD entryRva) {
+static DWORD ScanForOep(BYTE* dump, DWORD size, DWORD entryRva, bool allowCallCandidates) {
     DWORD searchEnd = min(entryRva + 0x200, size);
 
     for (DWORD i = entryRva; i < searchEnd - 7; ++i) {
         BYTE* p = dump + i;
 
-        if (p[0] == 0xE8) {
+        if (p[0] == 0xE8 && allowCallCandidates) {
             DWORD rel = *(int32_t*)(p + 1);
             DWORD target = (i + 5) + rel;
             if (target > 0x1000 && target < size) {
@@ -261,7 +256,18 @@ static bool BruteForceResolveThunk(BYTE* dump, DWORD thunkRva, ULONGLONG thunkVa
     }
 
     if (bestKey == (ULONGLONG)-1) return false;
-    if (bestKey > 0x100000) {
+
+    // For VMP-protected targets, IAT values are module-internal pointers
+    // that cannot match DLL exports. Brute-force on these will always
+    // produce very large keys. The VMP descriptor linking step handles
+    // these, so we can reject them here. For normal PEs, any large key
+    // is almost certainly a false positive — real import thunks have
+    // keys under ~0x10000 (64KB) since the resolved address IS the
+    // export address (key=0) or very near it.
+    // We raise the limit to 1GB to also cover edge cases (stripped
+    // fixups, forwarded exports, etc.) while still rejecting the
+    // obviously-wrong module-internal matches.
+    if (bestKey > 0x40000000) {
         DbgLogF("[*] rejecting brute-force match %s!%s (key 0x%llX too large)", bestModName, out.funcName.c_str(), bestKey);
         return false;
     }
@@ -316,6 +322,103 @@ static bool SafeResolveImport(BYTE* dump, DWORD rva, ULONGLONG addr, bool is64, 
         }
     }
     return ok;
+}
+
+// Scan import descriptors at importDirRva to extract function names from INT arrays
+// and IAT values. This handles VMP-encrypted import descriptors (garbage DLL names
+// but valid INT/IAT RVAs). DLL names are recovered by matching IAT values via
+// ResolveImportAddress.
+static void ScanImportDescriptors(BYTE* dump, DWORD size, DWORD importDirRva, bool is64,
+    std::map<std::string, std::vector<ImportEntry>>& importMap) {
+    if (!importDirRva || importDirRva + sizeof(IMAGE_IMPORT_DESCRIPTOR) > size) return;
+    int entrySize = is64 ? 8 : 4;
+    int totalAdded = 0;
+
+    IMAGE_IMPORT_DESCRIPTOR* descs = (IMAGE_IMPORT_DESCRIPTOR*)(dump + importDirRva);
+    for (IMAGE_IMPORT_DESCRIPTOR* d = descs; ; ++d) {
+        if ((BYTE*)d - dump + (int)sizeof(IMAGE_IMPORT_DESCRIPTOR) > (int)size) break;
+        if (d->Name == 0 && d->OriginalFirstThunk == 0 && d->FirstThunk == 0) break;
+        if (d->OriginalFirstThunk == 0 && d->FirstThunk == 0) continue;
+        DWORD intRva = d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk;
+        DWORD iatRva = d->FirstThunk ? d->FirstThunk : d->OriginalFirstThunk;
+        // Determine DLL name by matching IAT entries to loaded module exports
+        std::string dllName = "unknown.dll";
+        for (int probe = 0; probe < 5; ++probe) {
+            DWORD probeRva = iatRva + probe * entrySize;
+            if (probeRva + entrySize > size) break;
+            ULONGLONG probeAddr = is64 ? *(ULONGLONG*)(dump + probeRva) : *(DWORD*)(dump + probeRva);
+            if (probeAddr <= 0x10000) continue;
+            ImportResolve probeRes;
+            if (ResolveImportAddress((void*)(ULONG_PTR)probeAddr, probeRes)) {
+                dllName = probeRes.moduleName;
+                break;
+            }
+        }
+        int idx = 0;
+        while (true) {
+            DWORD intRvaCur = intRva + idx * entrySize;
+            if (intRvaCur + entrySize > size) break;
+            ULONGLONG intVal = is64 ? *(ULONGLONG*)(dump + intRvaCur) : *(DWORD*)(dump + intRvaCur);
+            if (intVal == 0) break;
+            ULONGLONG iatVal = 0;
+            DWORD iatRvaCur = iatRva + idx * entrySize;
+            if (iatRvaCur + entrySize <= size)
+                iatVal = is64 ? *(ULONGLONG*)(dump + iatRvaCur) : *(DWORD*)(dump + iatRvaCur);
+
+            ImportEntry entry;
+            entry.dllName = dllName;
+            entry.thunkRva = iatRvaCur;
+            entry.ordinal = 0;
+            entry.byOrdinal = false;
+
+            if (is64 ? (intVal & IMAGE_ORDINAL_FLAG64) : (intVal & IMAGE_ORDINAL_FLAG32)) {
+                entry.ordinal = (DWORD)(intVal & 0xFFFF);
+                entry.byOrdinal = true;
+                entry.funcName = "ordinal_" + std::to_string(entry.ordinal);
+            } else {
+                DWORD hnRva = (DWORD)intVal;
+                if (hnRva + sizeof(IMAGE_IMPORT_BY_NAME) < size) {
+                    IMAGE_IMPORT_BY_NAME* ibn = (IMAGE_IMPORT_BY_NAME*)(dump + hnRva);
+                    char* fn = (char*)ibn->Name;
+                    SIZE_T maxLen = size - hnRva - offsetof(IMAGE_IMPORT_BY_NAME, Name);
+                    fn[maxLen - 1] = 0;
+                    entry.funcName = fn;
+                } else {
+                    entry.funcName = "unknown_" + std::to_string(idx);
+                }
+                if (entry.funcName.empty() || entry.funcName.find_first_not_of(
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@?.~-") != std::string::npos) {
+                    if (iatVal > 0x10000) {
+                        ImportResolve addrResolved;
+                        if (ResolveImportAddress((void*)(ULONG_PTR)iatVal, addrResolved)) {
+                            entry.funcName = addrResolved.funcName;
+                            entry.dllName = addrResolved.moduleName;
+                            entry.byOrdinal = addrResolved.byOrdinal;
+                            entry.ordinal = addrResolved.ordinal;
+                        }
+                    }
+                }
+            }
+            bool found = false;
+            auto it = importMap.find(entry.dllName);
+            if (it != importMap.end()) {
+                for (auto& e : it->second) {
+                    if (e.funcName == entry.funcName && e.ordinal == entry.ordinal) {
+                        if (e.thunkRva == 0) e.thunkRva = entry.thunkRva;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                importMap[entry.dllName].push_back(entry);
+                totalAdded++;
+            }
+            ++idx;
+        }
+    }
+    if (totalAdded > 0)
+        DbgLogF("[*] descriptor scan: added %d imports from %d descriptors", totalAdded, descs[0].Name ? 1 : 0);
 }
 
 // Parse VMP's own import table and merge entries into importMap.
@@ -375,6 +478,18 @@ static void MergeVmpImportTable(BYTE* dump, DWORD sizeOfImage, DWORD vmpImportRv
                 } else {
                     entry.funcName = "unknown";
                 }
+
+                // If name looks encrypted (non-printable) or is "unknown", try to
+                // resolve the runtime address to get the real function name
+                if (entry.funcName == "unknown" || entry.funcName.find_first_not_of(
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@?.~-") != std::string::npos) {
+                    ImportResolve addrResolved;
+                    if (resolvedAddr > 0x10000 && ResolveImportAddress((void*)(ULONG_PTR)resolvedAddr, addrResolved)) {
+                        entry.funcName = addrResolved.funcName;
+                        entry.ordinal = addrResolved.ordinal;
+                        entry.byOrdinal = addrResolved.byOrdinal;
+                    }
+                }
             }
 
             // Skip if already in importMap
@@ -392,8 +507,6 @@ static void MergeVmpImportTable(BYTE* dump, DWORD sizeOfImage, DWORD vmpImportRv
                 importMap[dllName].push_back(entry);
             }
 
-            // Write resolved address back to IAT area in dump (it may already be correct but ensure)
-            // Only write if we have a valid thunkRva (we don't for VMP entries, so skip)
             totalResolved++;
             ++idx;
         }
@@ -500,6 +613,176 @@ static bool RebuildImportTableViaScan(BYTE* dump, DWORD size, DWORD imageBase, b
         MergeVmpImportTable(dump, size, vmpImportRva, is64, importMap);
     }
 
+    // --- Link thunk RVAs to VMP import descriptor entries ---
+    // VMP's import descriptors define DLL+function for synthetic IAT ranges.
+    // Match discovered FF 15/FF 25 thunk RVAs against each descriptor's
+    // FirstThunk array to attach names to entries that failed brute-force.
+    int entrySize = is64 ? 8 : 4;
+    if (vmpImportRva && !uniqueThunks.empty()) {
+        int linkedCount = 0;
+        IMAGE_IMPORT_DESCRIPTOR* vmpDescs = (IMAGE_IMPORT_DESCRIPTOR*)(dump + vmpImportRva);
+        for (IMAGE_IMPORT_DESCRIPTOR* d = vmpDescs; d->Name != 0; ++d) {
+            if ((BYTE*)d - dump + sizeof(IMAGE_IMPORT_DESCRIPTOR) > (int)size) break;
+            if (d->Name >= size) continue;
+            if (d->FirstThunk == 0 || d->FirstThunk >= size) continue;
+            if (d->OriginalFirstThunk == 0 || d->OriginalFirstThunk >= size) continue;
+
+            char* dllName = (char*)(dump + d->Name);
+            DWORD ftStart = d->FirstThunk;
+            DWORD ftEnd = ftStart + 200 * entrySize;
+            if (ftEnd > size) ftEnd = size;
+
+            for (auto& [rva, addr] : uniqueThunks) {
+                if (rva < ftStart || rva >= ftEnd) continue;
+                DWORD idx = (rva - ftStart) / entrySize;
+
+                ULONGLONG intVal = 0;
+                DWORD intRva = d->OriginalFirstThunk + idx * entrySize;
+                if (intRva + entrySize > size) continue;
+                intVal = is64
+                    ? *(ULONGLONG*)(dump + intRva)
+                    : *(DWORD*)(dump + intRva);
+                if (intVal == 0) continue;
+
+                bool alreadyExists = false;
+                auto it = importMap.find(dllName);
+                if (it != importMap.end()) {
+                    for (auto& e : it->second) {
+                        if (e.thunkRva == rva) { alreadyExists = true; break; }
+                    }
+                    if (!alreadyExists) {
+                        for (auto& e : it->second) {
+                            if (e.thunkRva == 0) { e.thunkRva = rva; alreadyExists = true; break; }
+                        }
+                    }
+                }
+                if (alreadyExists) continue;
+
+                ImportEntry entry;
+                entry.dllName = dllName;
+                entry.ordinal = 0;
+                entry.byOrdinal = false;
+                entry.thunkRva = rva;
+
+                if (is64 ? (intVal & IMAGE_ORDINAL_FLAG64) : (intVal & IMAGE_ORDINAL_FLAG32)) {
+                    entry.ordinal = (DWORD)(intVal & 0xFFFF);
+                    entry.byOrdinal = true;
+                    entry.funcName = "ordinal_" + std::to_string(entry.ordinal);
+                } else {
+                    DWORD hnRva = (DWORD)intVal;
+                    if (hnRva + sizeof(IMAGE_IMPORT_BY_NAME) < size) {
+                        IMAGE_IMPORT_BY_NAME* ibn = (IMAGE_IMPORT_BY_NAME*)(dump + hnRva);
+                        char* fn = (char*)ibn->Name;
+                        SIZE_T maxLen = size - hnRva - offsetof(IMAGE_IMPORT_BY_NAME, Name);
+                        fn[maxLen - 1] = 0;
+                        entry.funcName = fn;
+                    } else {
+                        entry.funcName = "encrypted_" + std::to_string(rva);
+                    }
+                }
+                importMap[dllName].push_back(entry);
+                linkedCount++;
+            }
+        }
+        if (linkedCount > 0)
+            DbgLogF("[+] linked %d thunk RVAs to VMP import descriptors", linkedCount);
+    }
+
+    // If we found very few imports (likely VMP import protection), scan for
+    // function pointers in all data sections and writable sections
+    size_t totalBeforeScan = 0;
+    for (auto& [dll, entries] : importMap) totalBeforeScan += entries.size();
+
+    if (totalBeforeScan < 50) {
+        DbgLogF("[*] only %zu imports from scan, trying function pointer scan...", totalBeforeScan);
+
+        std::set<ULONGLONG> seenAddrs;
+        int entrySize = is64 ? 8 : 4;
+        int fpFound = 0;
+
+        auto resolveFuncPtr = [&](DWORD rva, ULONGLONG addr) {
+            if (addr <= 0x10000 || addr >= 0x7FFFFFFF0000ULL) return;
+            if (seenAddrs.find(addr) != seenAddrs.end()) return;
+            seenAddrs.insert(addr);
+            ImportResolve resolved;
+            if (!SafeResolveImport(dump, rva, addr, is64, resolved)) return;
+            ImportEntry entry;
+            entry.dllName = resolved.moduleName;
+            entry.funcName = resolved.funcName;
+            entry.ordinal = resolved.ordinal;
+            entry.byOrdinal = resolved.byOrdinal;
+            entry.thunkRva = rva;
+            importMap[resolved.moduleName].push_back(entry);
+            fpFound++;
+            if (fpFound <= 5)
+                DbgLogF("[*] func-ptr: %s!%s (RVA 0x%X)", resolved.moduleName.c_str(), resolved.funcName.c_str(), rva);
+        };
+
+        // Scan PE header's IAT directory
+        DbgLog("[*] funcptr: scanning IAT directory...");
+        {
+            DWORD iatDirRva = 0, iatDirSize = 0;
+            if (is64) {
+                iatDirRva = ((IMAGE_NT_HEADERS64*)(dump + ((IMAGE_DOS_HEADER*)dump)->e_lfanew))
+                    ->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress;
+                iatDirSize = ((IMAGE_NT_HEADERS64*)(dump + ((IMAGE_DOS_HEADER*)dump)->e_lfanew))
+                    ->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size;
+            } else {
+                iatDirRva = ((IMAGE_NT_HEADERS32*)(dump + ((IMAGE_DOS_HEADER*)dump)->e_lfanew))
+                    ->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress;
+                iatDirSize = ((IMAGE_NT_HEADERS32*)(dump + ((IMAGE_DOS_HEADER*)dump)->e_lfanew))
+                    ->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size;
+            }
+            if (iatDirRva && iatDirSize && iatDirRva + entrySize < size) {
+                DWORD end = min(iatDirRva + iatDirSize, size);
+                for (DWORD r = iatDirRva; r + entrySize <= end; r += entrySize) {
+                    if (r + entrySize > size) break;
+                    ULONGLONG a = is64 ? *(ULONGLONG*)(dump + r) : *(DWORD*)(dump + r);
+                    resolveFuncPtr(r, a);
+                }
+            }
+        }
+        DbgLog("[*] funcptr: IAT dir scan done");
+
+        // Scan VMP import table's FirstThunk range
+        DbgLog("[*] funcptr: scanning VMP FT range...");
+        if (vmpImportRva && vmpImportRva + sizeof(IMAGE_IMPORT_DESCRIPTOR) < size) {
+            IMAGE_IMPORT_DESCRIPTOR* d = (IMAGE_IMPORT_DESCRIPTOR*)(dump + vmpImportRva);
+            for (; d->Name != 0; ++d) {
+                if ((BYTE*)d - dump + (int)sizeof(IMAGE_IMPORT_DESCRIPTOR) > (int)size) break;
+                if (d->FirstThunk == 0 || d->FirstThunk >= size) continue;
+                DWORD end = min(d->FirstThunk + 200 * entrySize, size);
+                for (DWORD r = d->FirstThunk; r + entrySize <= end; r += entrySize) {
+                    if (r + entrySize > size) break;
+                    ULONGLONG a = is64 ? *(ULONGLONG*)(dump + r) : *(DWORD*)(dump + r);
+                    if (a == 0) break;
+                    resolveFuncPtr(r, a);
+                }
+            }
+        }
+        DbgLog("[*] funcptr: VMP FT scan done");
+
+        // Scan original import descriptors (the 4 descriptors found by
+        // FindOriginalImportDirectory at the PE header's updated import dir).
+        // These have valid INT/IAT arrays even though DLL names are encrypted.
+        DbgLog("[*] funcptr: scanning original import descriptors...");
+        {
+            DWORD descRva = 0;
+            if (is64)
+                descRva = ((IMAGE_NT_HEADERS64*)(dump + ((IMAGE_DOS_HEADER*)dump)->e_lfanew))
+                    ->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+            else
+                descRva = ((IMAGE_NT_HEADERS32*)(dump + ((IMAGE_DOS_HEADER*)dump)->e_lfanew))
+                    ->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+            if (descRva)
+                ScanImportDescriptors(dump, size, descRva, is64, importMap);
+        }
+        DbgLog("[*] funcptr: descriptor scan done");
+
+        if (fpFound > 0)
+            DbgLogF("[+] function pointer scan found %d additional imports", fpFound);
+    }
+
     if (importMap.empty()) {
         DbgLog("[!] could not resolve any import addresses");
         return false;
@@ -568,9 +851,10 @@ static bool RebuildImportTableViaScan(BYTE* dump, DWORD size, DWORD imageBase, b
     ZeroMemory(descs, descCount * sizeof(IMAGE_IMPORT_DESCRIPTOR));
 
     DWORD nameOffset = offset;
-    DWORD iatOffset = offset;
 
     DWORD descIndex = 0;
+    // thunkRva → new FirstThunk entry RVA (for code patching)
+    std::map<DWORD, DWORD> iatSlotPatch;
     for (auto& [dll, entries] : importMap) {
         IMAGE_IMPORT_DESCRIPTOR& desc = descs[descIndex];
 
@@ -579,62 +863,92 @@ static bool RebuildImportTableViaScan(BYTE* dump, DWORD size, DWORD imageBase, b
         strcpy_s((char*)(importData + nameOffset), (DWORD)dll.size() + 1, dll.c_str());
         nameOffset += (DWORD)dll.size() + 1;
 
-        // IAT entries follow the name string for this DLL
-        iatOffset = nameOffset;
-        desc.OriginalFirstThunk = newDataRva + iatOffset;
-        desc.FirstThunk = newDataRva + iatOffset;
+        // Reserve contiguous space for the INT/IAT thunk array
+        DWORD thunkArrayOffset = nameOffset;
+        DWORD thunkArraySize = ((DWORD)entries.size() + 1) * (is64 ? 8 : 4);
+        desc.OriginalFirstThunk = newDataRva + thunkArrayOffset;
+        desc.FirstThunk = newDataRva + thunkArrayOffset;
+        nameOffset += thunkArraySize;
 
-        for (auto& e : entries) {
+        // Write hint/name struct data and fill in thunk entries
+        DWORD hintOffset = nameOffset;
+        for (size_t i = 0; i < entries.size(); i++) {
+            auto& e = entries[i];
+            DWORD newThunkRva = newDataRva + thunkArrayOffset + (DWORD)i * (is64 ? 8 : 4);
             if (e.byOrdinal) {
-                if (is64) {
-                    *(ULONGLONG*)(importData + iatOffset) = IMAGE_ORDINAL_FLAG64 | e.ordinal;
-                    iatOffset += 8;
-                } else {
-                    *(DWORD*)(importData + iatOffset) = IMAGE_ORDINAL_FLAG32 | e.ordinal;
-                    iatOffset += 4;
-                }
+                if (is64)
+                    *(ULONGLONG*)(importData + thunkArrayOffset + i * 8) = IMAGE_ORDINAL_FLAG64 | e.ordinal;
+                else
+                    *(DWORD*)(importData + thunkArrayOffset + i * 4) = IMAGE_ORDINAL_FLAG32 | e.ordinal;
             } else {
-                // hint/name entry: word hint + name + null
-                DWORD hintNameRva = newDataRva + iatOffset;
-                *(WORD*)(importData + iatOffset) = 0; // hint
-                iatOffset += 2;
-                strcpy_s((char*)(importData + iatOffset), (DWORD)e.funcName.size() + 1, e.funcName.c_str());
-                iatOffset += (DWORD)e.funcName.size() + 1;
+                DWORD hintNameRva = newDataRva + hintOffset;
+                *(WORD*)(importData + hintOffset) = 0;
+                hintOffset += 2;
+                strcpy_s((char*)(importData + hintOffset), (DWORD)e.funcName.size() + 1, e.funcName.c_str());
+                hintOffset += (DWORD)e.funcName.size() + 1;
+                if (hintOffset % 2) { importData[hintOffset] = 0; hintOffset++; }
 
-                // align to 2 bytes
-                if (iatOffset % 2) { importData[iatOffset] = 0; iatOffset++; }
-
-                if (is64) {
-                    *(ULONGLONG*)(importData + iatOffset) = hintNameRva;
-                    iatOffset += 8;
-                    // also update the original IAT entry in the dump to point to this hint/name
-                    if (e.thunkRva != 0 && e.thunkRva + 8 <= size)
-                        *(ULONGLONG*)(dump + e.thunkRva) = hintNameRva;
-                } else {
-                    *(DWORD*)(importData + iatOffset) = hintNameRva;
-                    iatOffset += 4;
-                    if (e.thunkRva != 0 && e.thunkRva + 4 <= size)
-                        *(DWORD*)(dump + e.thunkRva) = hintNameRva;
-                }
+                if (is64)
+                    *(ULONGLONG*)(importData + thunkArrayOffset + i * 8) = hintNameRva;
+                else
+                    *(DWORD*)(importData + thunkArrayOffset + i * 4) = hintNameRva;
             }
+            if (e.thunkRva != 0)
+                iatSlotPatch[e.thunkRva] = newThunkRva;
         }
 
         // null terminator for this DLL's thunk array
-        if (is64) {
-            *(ULONGLONG*)(importData + iatOffset) = 0;
-            iatOffset += 8;
-        } else {
-            *(DWORD*)(importData + iatOffset) = 0;
-            iatOffset += 4;
-        }
-        nameOffset = iatOffset;
+        if (is64)
+            *(ULONGLONG*)(importData + thunkArrayOffset + entries.size() * 8) = 0;
+        else
+            *(DWORD*)(importData + thunkArrayOffset + entries.size() * 4) = 0;
 
+        nameOffset = hintOffset;
         descIndex++;
     }
 
     // null terminator for import descriptors (already zeroed)
 
+    // Patch code instructions to reference the new IAT entries
+    {
+        int patchedCount = 0;
+        std::map<DWORD, std::vector<DWORD>> instRefs;
+        for (DWORD i = 0; i < size - 8; ++i) {
+            BYTE* p = dump + i;
+            if ((p[0] == 0xFF && (p[1] == 0x15 || p[1] == 0x25))) {
+                DWORD targetRva;
+                if (is64) {
+                    int32_t disp = *(int32_t*)(p + 2);
+                    targetRva = (DWORD)(i + 6 + disp);
+                } else {
+                    targetRva = *(uint32_t*)(p + 2);
+                }
+                if (iatSlotPatch.find(targetRva) != iatSlotPatch.end())
+                    instRefs[targetRva].push_back(i);
+            }
+        }
+        for (auto& [thunkRva, instRvas] : instRefs) {
+            auto it = iatSlotPatch.find(thunkRva);
+            if (it == iatSlotPatch.end()) continue;
+            DWORD newTargetRva = it->second;
+            for (DWORD instRva : instRvas) {
+                if (instRva + 6 > size) continue;
+                BYTE* inst = dump + instRva;
+                if (is64) {
+                    int32_t newDisp = (int32_t)(newTargetRva - (instRva + 6));
+                    *(int32_t*)(inst + 2) = newDisp;
+                } else {
+                    *(DWORD*)(inst + 2) = newTargetRva;
+                }
+                patchedCount++;
+            }
+        }
+        if (patchedCount > 0)
+            DbgLogF("[+] patched %d code references to new IAT", patchedCount);
+    }
+
     // Update the import directory in the dumped PE
+    offset = nameOffset; // total bytes used
     if (is64) {
         IMAGE_NT_HEADERS64* nt64 = (IMAGE_NT_HEADERS64*)(dump + dos->e_lfanew);
         nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress = newDataRva;
@@ -700,7 +1014,28 @@ static void FixSectionHeaders(BYTE* dump, DWORD sizeOfImage) {
     }
 }
 
+// Bounds-checked PE header accessor for use on (possibly corrupted) raw dumps.
+static bool PeHeaderIsUsable(BYTE* dump, DWORD size) {
+    if (!dump || size < 0x1000) return false;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)dump;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    DWORD lfanew = dos->e_lfanew;
+    if (lfanew == 0 || lfanew + 0x400 > size) return false;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(dump + lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    WORD count = nt->FileHeader.NumberOfSections;
+    if (count == 0 || count > 96) return false;
+    DWORD secEnd = lfanew + 4 + 20 + nt->FileHeader.SizeOfOptionalHeader +
+        (DWORD)count * sizeof(IMAGE_SECTION_HEADER);
+    if (secEnd > size) return false;
+    return true;
+}
+
 static void PreserveResourceDirectory(BYTE* dump, DWORD sizeOfImage) {
+    if (!PeHeaderIsUsable(dump, sizeOfImage)) {
+        DbgLog("[!] PE header unusable, skipping resource preservation");
+        return;
+    }
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)dump;
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(dump + dos->e_lfanew);
     bool is64 = nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
@@ -745,6 +1080,10 @@ static void PreserveResourceDirectory(BYTE* dump, DWORD sizeOfImage) {
 }
 
 static void RebuildRelocationTable(BYTE* dump, DWORD sizeOfImage, DWORD imageBase) {
+    if (!PeHeaderIsUsable(dump, sizeOfImage)) {
+        DbgLog("[!] PE header unusable, skipping relocation rebuild");
+        return;
+    }
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)dump;
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(dump + dos->e_lfanew);
     bool is64 = nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
@@ -938,7 +1277,7 @@ static void FindVmEntries(BYTE* dump, DWORD size, DWORD vmDispatcher) {
 }
 
 bool DumpProcess(DumpContext& ctx) {
-    ULONGLONG baseAddr = FindImageBase();
+    ULONGLONG baseAddr = FindTargetModuleBase();
     if (!baseAddr) {
         DbgLog("[!] could not find image base");
         return false;
@@ -1706,7 +2045,9 @@ static bool ResolveFromIntArrays(BYTE* dump, DWORD sizeOfImage,
     return false;
 }
 
-bool ReconstructPe(DumpContext& ctx, const std::wstring& outputPath) {
+// Core reconstruction logic (no SEH — use SafeReconstructCall wrapper for crash safety)
+static bool ReconstructPeCore(DumpContext& ctx, const wchar_t* outputPath) {
+    (void)outputPath; // unused in core — file write is done by wrapper
     BYTE* dump = ctx.rawDump;
     if (!dump) return false;
 
@@ -1731,8 +2072,10 @@ bool ReconstructPe(DumpContext& ctx, const std::wstring& outputPath) {
     WORD sectionCount = nt->FileHeader.NumberOfSections;
     IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
 
-    // Find OEP
-    DWORD realOep = ScanForOep(dump, ctx.sizeOfImage, ctx.oepRva);
+    // Find OEP. DLLs skip the E8-call heuristic: the entry points at the real
+    // DllMain after unpack, and the first call inside its prologue is a false
+    // positive. Only trampoline patterns (E9 jmp / push-ret) are trusted there.
+    DWORD realOep = ScanForOep(dump, ctx.sizeOfImage, ctx.oepRva, !IsDllTarget());
     if (realOep != ctx.oepRva) {
         DbgLogF("[+] found real OEP: 0x%X (entry was 0x%X)", realOep, ctx.oepRva);
         ctx.oepRva = realOep;
@@ -1778,6 +2121,15 @@ bool ReconstructPe(DumpContext& ctx, const std::wstring& outputPath) {
             ctx.sizeOfImage = realSizeOfImage;
         }
     }
+
+    // Back up the (already-edited) MZ/NT headers. The import-fix strategies can
+    // dereference corrupt descriptors whose thunk/IAT RVAs point back at low
+    // offsets, writing over the header region and later crashing every phase
+    // that re-reads it. The backup is restored after the strategies finish.
+    std::vector<BYTE> hdrSave;
+    DWORD hdrSize = nt->OptionalHeader.SizeOfHeaders;
+    if (hdrSize >= 0x40 && hdrSize <= ctx.rawSize)
+        hdrSave.assign(dump, dump + hdrSize);
 
     // Rebuild IAT using multi-strategy approach:
     // 0. Name-based thunk resolution (handles VMP with hint/name RVAs in IAT)
@@ -1863,18 +2215,28 @@ bool ReconstructPe(DumpContext& ctx, const std::wstring& outputPath) {
                     DWORD thunkRva = imports->OriginalFirstThunk ? imports->OriginalFirstThunk : imports->FirstThunk;
                     if (thunkRva == 0 || thunkRva >= ctx.sizeOfImage) continue;
                     if (imports->FirstThunk == 0 || imports->FirstThunk >= ctx.sizeOfImage) continue;
-                    DWORD copySize = 0;
+
+                    // Bound the null-terminator scan to the image and cap the
+                    // copy length. A stray/one-shot descriptor (or corrupted
+                    // thunks) used to walk past the buffer and heap-corrupt the
+                    // dump, crashing the worker much later.
+                    BYTE* stop = dump + ctx.sizeOfImage;
+                    DWORD intBytes = 0;
                     if (ctx.is64Bit) {
-                        for (ULONGLONG* p = (ULONGLONG*)(dump + thunkRva); *p != 0; p++)
-                            copySize += 8;
-                        copySize += 8;
-                        memcpy(dump + imports->FirstThunk, dump + thunkRva, copySize);
+                        ULONGLONG* p = (ULONGLONG*)(dump + thunkRva);
+                        for (; (BYTE*)p + 8 <= stop; ++p) {
+                            if (*p == 0) { intBytes = (DWORD)((BYTE*)p - (dump + thunkRva)) + 8; break; }
+                        }
                     } else {
-                        for (DWORD* p = (DWORD*)(dump + thunkRva); *p != 0; p++)
-                            copySize += 4;
-                        copySize += 4;
-                        memcpy(dump + imports->FirstThunk, dump + thunkRva, copySize);
+                        DWORD* p = (DWORD*)(dump + thunkRva);
+                        for (; (BYTE*)p + 4 <= stop; ++p) {
+                            if (*p == 0) { intBytes = (DWORD)((BYTE*)p - (dump + thunkRva)) + 4; break; }
+                        }
                     }
+                    if (intBytes == 0) continue;
+                    if (intBytes > ctx.sizeOfImage - imports->FirstThunk)
+                        intBytes = ctx.sizeOfImage - imports->FirstThunk;
+                    memcpy(dump + imports->FirstThunk, dump + thunkRva, intBytes);
                 }
                 iatRebuilt = true;
                 DbgLog("[+] IAT rebuilt via INT copy (last resort)");
@@ -1884,6 +2246,8 @@ bool ReconstructPe(DumpContext& ctx, const std::wstring& outputPath) {
 
     // Ensure import data is covered by a section (extend last section if needed)
     // Preserve resources
+    if (!hdrSave.empty())
+        memcpy(dump, hdrSave.data(), hdrSave.size());
     PreserveResourceDirectory(dump, ctx.sizeOfImage);
 
     // Rebuild relocation table if needed
@@ -1980,23 +2344,33 @@ bool ReconstructPe(DumpContext& ctx, const std::wstring& outputPath) {
         }
     }
 
-    // Write the output PE
-    HANDLE hFile = CreateFileW(outputPath.c_str(), GENERIC_WRITE, 0, nullptr,
+    return true;
+}
+
+// Writes the final PE dump to disk. Can be called on any outcome.
+// Uses raw wchar_t* to avoid C++ wstring (SEH-safe).
+static bool WritePeFile(BYTE* dump, const wchar_t* outputPath) {
+    if (!dump || !outputPath) return false;
+
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)dump;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(dump + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    HANDLE hFile = CreateFileW(outputPath, GENERIC_WRITE, 0, nullptr,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
         DbgLogF("[!] failed to create output, error: %u", GetLastError());
         return false;
     }
 
-    // Calculate final file size from section headers
-    sections = IMAGE_FIRST_SECTION(nt);
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
     DWORD fileSize = nt->OptionalHeader.SizeOfHeaders;
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
         DWORD end = sections[i].PointerToRawData + sections[i].SizeOfRawData;
         if (end > fileSize) fileSize = end;
     }
 
-    // Align
     fileSize = (fileSize + 0x1FF) & ~0x1FF;
 
     DWORD written = 0;
@@ -2004,11 +2378,33 @@ bool ReconstructPe(DumpContext& ctx, const std::wstring& outputPath) {
     CloseHandle(hFile);
 
     if (ok)
-        DbgLogF("[+] PE written: %S (%u bytes)", outputPath.c_str(), written);
+        DbgLogF("[+] PE written: %S (%u bytes)", outputPath, written);
     else
         DbgLog("[!] failed to write output");
 
     return ok;
+}
+
+bool ReconstructPe(DumpContext& ctx, const std::wstring& outputPath) {
+    BYTE* dump = ctx.rawDump;
+    if (!dump) return false;
+
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)dump;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        DbgLog("[!] invalid DOS signature");
+        return false;
+    }
+
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(dump + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        DbgLog("[!] invalid NT signature");
+        return false;
+    }
+
+    // Run core reconstruction, then write the PE file
+    if (!ReconstructPeCore(ctx, outputPath.c_str()))
+        return false;
+    return WritePeFile(ctx.rawDump, outputPath.c_str());
 }
 
 void FreeDump(DumpContext& ctx) {

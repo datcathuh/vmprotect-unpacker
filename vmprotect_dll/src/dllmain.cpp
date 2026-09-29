@@ -1,10 +1,16 @@
 #include <Windows.h>
+#include <excpt.h>
 #include <tlhelp32.h>
 #include "anti/antidebug.h"
 #include "core/dump.h"
 #include "utils.h"
 
 HANDLE g_hPipe = INVALID_HANDLE_VALUE;
+
+static const DWORD g_t0 = GetTickCount();
+static void LogT(const char* msg) {
+    DbgLogF("[T+%ums] %s", (unsigned)(GetTickCount() - g_t0), msg);
+}
 
 static bool ConnectToPipe() {
     wchar_t pipeName[MAX_PATH];
@@ -27,11 +33,6 @@ static bool ConnectToPipe() {
     return false;
 }
 
-static ULONGLONG FindImageBase() {
-    PPEB peb = NtCurrentTeb()->ProcessEnvironmentBlock;
-    return (ULONGLONG)peb->Reserved3[1];
-}
-
 static bool IsValidMemory(const void* addr, SIZE_T size) {
     MEMORY_BASIC_INFORMATION mbi;
     return VirtualQuery(addr, &mbi, sizeof(mbi)) &&
@@ -39,9 +40,8 @@ static bool IsValidMemory(const void* addr, SIZE_T size) {
         (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
 }
 
-static bool IsOepReady() {
+static bool IsOepReady(ULONGLONG base) {
     BYTE buf[0x1000];
-    ULONGLONG base = FindImageBase();
     if (!base) return false;
 
     if (!IsValidMemory((void*)base, sizeof(buf))) return false;
@@ -126,18 +126,13 @@ static bool IsOepReady() {
         }
     }
 
-    // Tier 3: Fallback after 2+ seconds — check standard section names.
-    // This handles targets where VMP restored the original PE header
-    // or non-packed targets where nothing changed (Tier 1 never fires).
+    // Tier 3: Fallback after 2+ seconds — check for at least 2 valid
+    // non-empty sections (any name). This handles custom section names
+    // and VMP-protected binaries where standard section names are missing.
     if (pollCount >= 10) {
         int n = 0;
         for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-            char name[9] = {};
-            memcpy(name, sec[i].Name, 8);
-            if (strcmp(name, ".text") == 0 || strcmp(name, ".rdata") == 0 ||
-                strcmp(name, ".data") == 0 || strcmp(name, ".rsrc") == 0 ||
-                strcmp(name, ".reloc") == 0 || strcmp(name, ".pdata") == 0 ||
-                strcmp(name, ".idata") == 0)
+            if (sec[i].Misc.VirtualSize > 0x200 && sec[i].VirtualAddress > 0x1000)
                 n++;
         }
         if (n >= 2)
@@ -145,6 +140,12 @@ static bool IsOepReady() {
     }
 
     return false;
+}
+
+static bool IsAttachMode() {
+    wchar_t buf[16];
+    DWORD len = GetEnvironmentVariableW(L"VMPATTACH", buf, 16);
+    return len > 0 && wcscmp(buf, L"1") == 0;
 }
 
 static void SuspendOtherThreads() {
@@ -169,20 +170,132 @@ static void SuspendOtherThreads() {
     CloseHandle(hSnapshot);
 }
 
+// Reverse of SuspendOtherThreads — needed when attaching to a live process
+// (e.g. a running service) so we don't leave it frozen after dumping.
+static void ResumeOtherThreads() {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+
+    DWORD pid = GetCurrentProcessId();
+    DWORD tid = GetCurrentThreadId();
+    THREADENTRY32 te = { sizeof(THREADENTRY32) };
+
+    if (Thread32First(hSnapshot, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid && te.th32ThreadID != tid) {
+                HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                if (hThread) {
+                    ResumeThread(hThread);
+                    CloseHandle(hThread);
+                }
+            }
+        } while (Thread32Next(hSnapshot, &te));
+    }
+    CloseHandle(hSnapshot);
+}
+
+static std::wstring DirOf(const std::wstring& fullPath) {
+    std::wstring out = fullPath;
+    wchar_t* slash = wcsrchr(out.data(), L'\\');
+    if (slash) *slash = 0;
+    return out;
+}
+
+// For DLL targets without VMPOUTDIR, dump next to the target DLL itself
+// (never next to the host exe in %TEMP%).
+static void ConfigureDumpPath(wchar_t* outDir, bool dllTarget) {
+    if (GetEnvironmentVariableW(L"VMPOUTDIR", outDir, MAX_PATH) && outDir[0])
+        return;
+
+    if (dllTarget) {
+        wchar_t target[MAX_PATH] = L"";
+        if (GetEnvironmentVariableW(L"VMPTARGET", target, MAX_PATH) > 0 && target[0]) {
+            std::wstring dir = DirOf(target);
+            wcsncpy_s(outDir, MAX_PATH, dir.c_str(), dir.size());
+            return;
+        }
+    }
+
+    wchar_t exePath[MAX_PATH];
+    if (GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
+        wchar_t* slash = wcsrchr(exePath, L'\\');
+        if (slash) {
+            *(slash + 1) = 0;
+            wcsncpy_s(outDir, MAX_PATH, exePath, MAX_PATH);
+            return;
+        }
+    }
+    outDir[0] = 0;
+}
+
+static LONG OnReconstructFault(LPEXCEPTION_POINTERS ep) {
+    DbgLogF("[!] reconstruction fault at 0x%p (code 0x%08X)", ep->ExceptionRecord->ExceptionAddress, ep->ExceptionRecord->ExceptionCode);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Runs ReconstructPe behind SEH so a reconstruction fault cannot take down the
+// whole host process (the raw dump is already on disk by this point).
+static bool ReconstructPeGuarded(DumpContext& ctx, const std::wstring& outputPath) {
+    bool ok = false;
+    __try {
+        ok = ReconstructPe(ctx, outputPath);
+    } __except (OnReconstructFault(GetExceptionInformation())) {
+        ok = false;
+    }
+    return ok;
+}
+
 static DWORD WINAPI DumpWorker(LPVOID) {
     DbgLog("[*] dump worker started");
+    LogT("dump worker started");
 
     ConnectToPipe();
+    LogT("pipe connected");
+    bool attach = IsAttachMode();
     antidebug::PatchPeb();
     antidebug::ClearHardwareBreakpoints();
     antidebug::InstallVehHandler();
-    antidebug::PatchNtRaiseHardError();
+    if (!attach) {
+        // Only relevant while VMP is unpacking at load time. Attaching to a
+        // live process skips these to avoid destabilizing it.
+        // The NtRaiseHardError hook is opt-in (VMPNTHOOK=1): patching ntdll
+        // involves a VirtualProtect on its image which can hang the process on
+        // some systems, so it is disabled unless explicitly requested.
+        wchar_t noHook[8] = L"";
+        GetEnvironmentVariableW(L"VMPNTHOOK", noHook, 8);
+        if (wcscmp(noHook, L"1") == 0)
+            antidebug::PatchNtRaiseHardError();
+    }
+    if (attach) DbgLog("[*] attach mode (live process)");
+
+    bool dllTarget = IsDllTarget();
+    ULONGLONG targetBase = 0;
+
+    if (dllTarget) {
+        // The host loads the target DLL after we're injected; wait for it to appear.
+        DbgLog("[*] DLL target detected, waiting for module...");
+        for (int i = 0; i < 300; ++i) {
+            targetBase = FindTargetModuleBase();
+            if (targetBase) break;
+            Sleep(100);
+        }
+        if (!targetBase) {
+            DbgLog("[!] timeout waiting for target module to load");
+            antidebug::RemoveAll();
+            return 1;
+        }
+        DbgLogF("[+] target module at 0x%llX", targetBase);
+    } else {
+        targetBase = FindTargetModuleBase();
+        DbgLogF("[*] target module at 0x%llX", targetBase);
+    }
+    LogT("target module resolved");
 
     DbgLog("[*] waiting for VMP to finish unpacking...");
     DWORD waited = 0;
     bool ready = false;
     while (waited < 30000) {
-        if (IsOepReady()) {
+        if (IsOepReady(targetBase)) {
             DbgLogF("[+] unpack detected after %ums", waited);
             ready = true;
             break;
@@ -198,6 +311,7 @@ static DWORD WINAPI DumpWorker(LPVOID) {
         antidebug::RemoveAll();
         return 1;
     }
+    LogT("oep ready");
 
     // Short extra delay to ensure VMP fully completes all post-unpack
     // operations (fixups, TLS callbacks, etc.) before we freeze the process.
@@ -206,6 +320,7 @@ static DWORD WINAPI DumpWorker(LPVOID) {
 
     DbgLog("[*] suspending other threads...");
     SuspendOtherThreads();
+    LogT("threads suspended");
 
     DbgLog("[*] dumping process memory...");
     DumpContext ctx = {};
@@ -214,32 +329,43 @@ static DWORD WINAPI DumpWorker(LPVOID) {
         antidebug::RemoveAll();
         return 1;
     }
+    LogT("dump snapshot taken");
+
+    // Attached to a live process: unfreeze it now that the snapshot is taken.
+    if (attach) {
+        DbgLog("[*] resuming other threads...");
+        ResumeOtherThreads();
+    }
 
     wchar_t dumpPath[MAX_PATH];
+    const wchar_t* ext = dllTarget ? L"dll" : L"exe";
     wchar_t outDir[MAX_PATH] = L"";
-    if (GetEnvironmentVariableW(L"VMPOUTDIR", outDir, MAX_PATH) && outDir[0]) {
-        swprintf_s(dumpPath, L"%s\\dump_%d.exe", outDir, GetCurrentProcessId());
+    ConfigureDumpPath(outDir, dllTarget);
+    if (outDir[0])
+        swprintf_s(dumpPath, L"%s\\dump_%d.%s", outDir, GetCurrentProcessId(), ext);
+    else
+        swprintf_s(dumpPath, L"dump_%d.%s", GetCurrentProcessId(), ext);
+    DbgLogF("[*] writing raw dump to %S", dumpPath);
+    HANDLE hRaw = CreateFileW(dumpPath, GENERIC_WRITE, 0, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hRaw != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        WriteFile(hRaw, ctx.rawDump, (DWORD)ctx.rawSize, &written, nullptr);
+        CloseHandle(hRaw);
+        DbgLogF("[+] raw dump written: %u bytes", written);
     } else {
-        wchar_t exePath[MAX_PATH];
-        if (GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
-            wchar_t* slash = wcsrchr(exePath, L'\\');
-            if (slash) {
-                *(slash + 1) = 0;
-                swprintf_s(dumpPath, L"%sdump_%d.exe", exePath, GetCurrentProcessId());
-            } else {
-                swprintf_s(dumpPath, L"dump_%d.exe", GetCurrentProcessId());
-            }
-        } else {
-            swprintf_s(dumpPath, L"dump_%d.exe", GetCurrentProcessId());
-        }
+        DbgLog("[!] failed to create dump file");
     }
-    DbgLogF("[*] reconstructing PE -> %S", dumpPath);
+    LogT("raw dump written");
 
-    if (ReconstructPe(ctx, dumpPath)) {
-        DbgLogF("[+] dump saved to %S", dumpPath);
+    DbgLogF("[*] reconstructing PE import table...");
+    bool reconOk = ReconstructPeGuarded(ctx, dumpPath);
+    if (reconOk) {
+        DbgLogF("[+] PE dump saved to %S", dumpPath);
+    }
 
-        // Save VMP devirtualization disassembly if available
-        if (ctx.vmpDetected && ctx.devirtCount > 0) {
+    // Save VMP devirtualization disassembly if available
+    if (ctx.vmpDetected && ctx.devirtCount > 0) {
             wchar_t disasmPath[MAX_PATH];
             wcsncpy_s(disasmPath, dumpPath, MAX_PATH);
             wchar_t* dot = wcsrchr(disasmPath, L'.');
@@ -265,13 +391,13 @@ static DWORD WINAPI DumpWorker(LPVOID) {
                 WriteFile(hDisasm, header.c_str(), (DWORD)header.size(), &written, nullptr);
                 CloseHandle(hDisasm);
                 DbgLogF("[+] devirt disassembly saved to %S", disasmPath);
-            }
         }
     }
 
     FreeDump(ctx);
     antidebug::RemoveAll();
     DbgLog("[*] dump worker done");
+    LogT("dump worker done");
     if (g_hPipe && g_hPipe != INVALID_HANDLE_VALUE) {
         CloseHandle(g_hPipe);
         g_hPipe = INVALID_HANDLE_VALUE;
