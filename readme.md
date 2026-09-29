@@ -1,3 +1,6 @@
+
+
+
 # credits
 
 - deepseek - helped me actually understand the vmprotect source and write most of the unpack logic
@@ -7,6 +10,7 @@
 - vmprotect 3.5.1 source - https://0xacab.org/bidasci/vmprotect-3.5.1
 
 # notes
+THIS ISNT CLOSE TO DONE GOT SOME MAYOR BUGS BE AWARE
 
 u might get flagged for debugger but it still dumps / unpacks from what i noticed.
 
