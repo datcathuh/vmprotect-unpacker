@@ -4,7 +4,7 @@
 # credits
 
 - deepseek - helped me actually understand the vmprotect source and write most of the unpack logic
-- StormingMoon/VMProtectUnpacker - [inspired me & took some code from his base]
+- [StormingMoon/VMProtectUnpacker](https://github.com/StormingMoon/VMProtectUnpacker) - [inspired me & took some code from his base]
 - vmprotect 3.5.1 source - https://0xacab.org/bidasci/vmprotect-3.5.1
 
 # notes
